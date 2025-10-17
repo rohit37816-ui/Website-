@@ -1,115 +1,50 @@
+import express from "express";
+import session from "express-session";
+import bcrypt from "bcrypt";
+import multer from "multer";
+import { Storage } from "@google-cloud/storage";
+import sqlite3 from "sqlite3";
+import { open } from "sqlite";
+import rateLimit from "express-rate-limit";
+import helmet from "helmet";
+import dotenv from "dotenv";
+import path from "path";
 
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>My File Storage</title>
-  <style>
-    /* General body styles */
-    body {
-      margin: 0;
-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      background: linear-gradient(135deg, #6a11cb 0%, #2575fc 100%);
-      color: #fff;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      min-height: 100vh;
-    }
+dotenv.config();
+const app=express();
+app.use(helmet());
+app.use(express.json());
+app.use(express.urlencoded({extended:true}));
+app.use(rateLimit({windowMs:60000,max:100}));
+app.use(session({secret:process.env.SESSION_SECRET||"change_this",resave:false,saveUninitialized:false,cookie:{secure:process.env.NODE_ENV==="production"}}));
+app.use(express.static(path.join(process.cwd(),"public")));
 
-    h1 {
-      margin-top: 20px;
-      font-size: 2.5rem;
-      text-shadow: 2px 2px #00000050;
-    }
+const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:50*1024*1024}});
+const storageGCS=new Storage({keyFilename:process.env.GOOGLE_APPLICATION_CREDENTIALS});
+const BUCKET=process.env.GCS_BUCKET_NAME;
 
-    /* Card style container */
-    .card {
-      background: rgba(255, 255, 255, 0.1);
-      backdrop-filter: blur(10px);
-      border-radius: 15px;
-      padding: 20px 30px;
-      margin: 20px 0;
-      width: 90%;
-      max-width: 400px;
-      box-shadow: 0 8px 20px rgba(0,0,0,0.3);
-    }
+let db;
+(async()=>{ db=await open({filename:'./data.db',driver:sqlite3.Database}); await db.exec(`CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT UNIQUE,password_hash TEXT)`); await db.exec(`CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY AUTOINCREMENT,filename TEXT,gcs_path TEXT,uploader TEXT,created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`);})();
 
-    input, button {
-      width: 100%;
-      padding: 10px 15px;
-      margin: 10px 0;
-      border-radius: 8px;
-      border: none;
-      font-size: 1rem;
-    }
+function requireAuth(req,res,next){ if(req.session?.user?.username) return next(); res.status(401).send("Unauthorized");}
 
-    input {
-      background: rgba(255,255,255,0.2);
-      color: #fff;
-    }
+// Register
+app.post('/register',async(req,res)=>{ const {username,password}=req.body; if(!username||!password)return res.status(400).send("Missing"); const hash=await bcrypt.hash(password,10); try{ await db.run("INSERT INTO users(username,password_hash) VALUES(?,?)",[username,hash]); res.status(201).send("Registered"); }catch(e){ res.status(400).send("User exists"); }});
 
-    input::placeholder {
-      color: #ddd;
-    }
+// Login
+app.post('/login',async(req,res)=>{ const {username,password}=req.body; const user=await db.get("SELECT * FROM users WHERE username=?",[username]); if(!user) return res.status(401).send("Invalid"); const ok=await bcrypt.compare(password,user.password_hash); if(!ok) return res.status(401).send("Invalid"); req.session.user={username:user.username}; res.send("Logged in"); });
 
-    button {
-      background: #ff6a00;
-      background: linear-gradient(45deg, #ff6a00, #ffcc00);
-      color: #000;
-      font-weight: bold;
-      cursor: pointer;
-      transition: all 0.3s ease;
-    }
+// Logout
+app.post('/logout',(req,res)=>{ req.session.destroy(()=>res.send("Logged out")); });
 
-    button:hover {
-      transform: scale(1.05);
-      box-shadow: 0 5px 15px rgba(0,0,0,0.3);
-    }
+// Upload
+app.post('/upload',requireAuth,upload.single('file'),async(req,res)=>{ if(!req.file)return res.status(400).send("No file"); const filename=`${Date.now()}_${req.file.originalname}`; const bucket=storageGCS.bucket(BUCKET); const file=bucket.file(filename); const stream=file.createWriteStream({metadata:{contentType:req.file.mimetype},resumable:false}); stream.on('error',(err)=>{console.error(err);res.status(500).send("Upload error");}); stream.on('finish',async()=>{ await db.run("INSERT INTO files(filename,gcs_path,uploader) VALUES(?,?,?)",[req.file.originalname,filename,req.session.user.username]); res.status(201).send("Uploaded");}); stream.end(req.file.buffer); });
 
-    /* File list table */
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      margin-top: 10px;
-    }
+// List Files
+app.get('/files',requireAuth,async(req,res)=>{ const rows=await db.all("SELECT id,filename,gcs_path,uploader,created_at FROM files ORDER BY created_at DESC"); const bucket=storageGCS.bucket(BUCKET); const filesWithUrls=await Promise.all(rows.map(async r=>{ const file=bucket.file(r.gcs_path); const [url]=await file.getSignedUrl({action:'read',expires:Date.now()+60*60*1000}); return {...r,url}; })); res.json(filesWithUrls); });
 
-    th, td {
-      padding: 8px;
-      text-align: left;
-      border-bottom: 1px solid rgba(255,255,255,0.3);
-    }
-
-    th {
-      color: #ffeb3b;
-    }
-
-    a {
-      color: #00ffff;
-      text-decoration: none;
-    }
-
-    a:hover {
-      text-decoration: underline;
-    }
-
-    /* Responsive */
-    @media (max-width: 500px){
-      .card { padding: 15px; }
-      h1 { font-size: 2rem; }
-    }
-  </style>
-</head>
-<body>
-  <h1>My File Storage</h1>
-
-  <!-- Login Card -->
-  <div class="card">
-    <h2>Login</h2>
-    <form id="login">
-      <input type="text" name="username" placeholder="Username" required />
-      <input type="password" name="password" placeholder="Password" required />
+const PORT=process.env.PORT||3000;
+app.listen(PORT,()=>console.log(`Server running on port ${PORT}`));      <input type="password" name="password" placeholder="Password" required />
       <button type="submit">Login</button>
     </form>
   </div>
